@@ -1,0 +1,158 @@
+/**
+ * Credit Memos — issue credits against customers, apply to invoices
+ * Feature 5: Credit memo UI with apply-to-invoice workflow
+ */
+const CreditMemosPage = {
+    async render() {
+        const memos = await API.get('/credit-memos');
+        return renderListPage({
+            title: 'Credit Memos',
+            headerHtml: `<button class="btn btn-primary" onclick="CreditMemosPage.showForm()">+ New Credit Memo</button>`,
+            empty: '<p>No credit memos yet</p>',
+            columns: ['#', 'Customer', 'Date', 'Status',
+                { label: 'Total', cls: 'amount' }, { label: 'Remaining', cls: 'amount' }, 'Actions'],
+            items: memos,
+            row: m => `<tr>
+                    <td><strong>${escapeHtml(m.memo_number)}</strong></td>
+                    <td>${escapeHtml(m.customer_name || '')}</td>
+                    <td>${formatDate(m.date)}</td>
+                    <td>${statusBadge(m.status)}</td>
+                    <td class="amount">${formatCurrency(m.total)}</td>
+                    <td class="amount">${formatCurrency(m.balance_remaining)}</td>
+                    <td class="actions">
+                        ${m.status === 'issued' ? `<button class="btn btn-sm btn-primary" onclick="CreditMemosPage.showApply(${m.id})">Apply</button>` : ''}
+                    </td>
+                </tr>`,
+        });
+    },
+
+    _items: [],
+    lineCount: 0,
+
+    async showForm() {
+        const [customers, items] = await Promise.all([
+            API.get('/customers?active_only=true'),
+            API.get('/items?active_only=true'),
+        ]);
+        CreditMemosPage._items = items;
+        CreditMemosPage.lineCount = 1;
+        const classGroup = await classFormGroupHtml();
+
+        const custOpts = customers.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+        const itemOpts = items.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+
+        openModal('New Credit Memo', `
+            <form onsubmit="CreditMemosPage.save(event)">
+                <div class="form-grid">
+                    <div class="form-group"><label>Customer *</label>
+                        <select name="customer_id" required><option value="">Select...</option>${custOpts}</select></div>
+                    <div class="form-group"><label>Date *</label>
+                        <input name="date" type="date" required value="${todayISO()}"></div>
+                    <div class="form-group"><label>Tax Rate (%)</label>
+                        <input name="tax_rate" type="number" step="0.01" value="0"></div>
+                    ${classGroup}
+                </div>
+                <h3 style="margin:12px 0 8px;font-size:14px;">Credit Lines</h3>
+                <table class="line-items-table">
+                    <thead><tr><th>Item</th><th>Description</th><th class="col-qty">Qty</th><th class="col-rate">Rate</th></tr></thead>
+                    <tbody id="cm-lines">
+                        <tr data-cmline="0">
+                            <td><select class="line-item"><option value="">--</option>${itemOpts}</select></td>
+                            <td><input class="line-desc"></td>
+                            <td><input class="line-qty" type="number" step="0.01" value="1"></td>
+                            <td><input class="line-rate" type="number" step="0.01" value="0"></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <button type="button" class="btn btn-sm btn-secondary" style="margin-top:8px;" onclick="CreditMemosPage.addLine()">+ Add Line</button>
+                <div class="form-group" style="margin-top:12px;"><label>Notes</label>
+                    <textarea name="notes"></textarea></div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Credit Memo</button>
+                </div>
+            </form>`);
+    },
+
+    addLine() {
+        const idx = CreditMemosPage.lineCount++;
+        const itemOpts = CreditMemosPage._items.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+        $('#cm-lines').insertAdjacentHTML('beforeend', `
+            <tr data-cmline="${idx}">
+                <td><select class="line-item"><option value="">--</option>${itemOpts}</select></td>
+                <td><input class="line-desc"></td>
+                <td><input class="line-qty" type="number" step="0.01" value="1"></td>
+                <td><input class="line-rate" type="number" step="0.01" value="0"></td>
+            </tr>`);
+    },
+
+    async save(e) {
+        e.preventDefault();
+        const form = e.target;
+        const lines = [];
+        $$('#cm-lines tr').forEach((row, i) => {
+            lines.push({
+                item_id: row.querySelector('.line-item')?.value ? parseInt(row.querySelector('.line-item').value) : null,
+                description: row.querySelector('.line-desc')?.value || '',
+                quantity: parseFloat(row.querySelector('.line-qty')?.value) || 1,
+                rate: parseFloat(row.querySelector('.line-rate')?.value) || 0,
+                line_order: i,
+            });
+        });
+        try {
+            await API.post('/credit-memos', {
+                customer_id: parseInt(form.customer_id.value),
+                date: form.date.value,
+                tax_rate: (parseFloat(form.tax_rate.value) || 0) / 100,
+                notes: form.notes.value || null,
+                class_id: classIdFromForm(form),
+                lines,
+            });
+            toast('Credit memo created');
+            closeModal();
+            App.navigate('#/credit-memos');
+        } catch (err) { toast(err.message, 'error'); }
+    },
+
+    async showApply(cmId) {
+        const cm = await API.get(`/credit-memos/${cmId}`);
+        const invoices = await API.get(`/invoices?customer_id=${cm.customer_id}`);
+        const openInv = invoices.filter(i => i.status !== 'void' && i.status !== 'paid' && i.balance_due > 0);
+
+        let rows = openInv.map(inv => `
+            <tr>
+                <td>${escapeHtml(inv.invoice_number)}</td>
+                <td class="amount">${formatCurrency(inv.balance_due)}</td>
+                <td><input type="number" step="0.01" class="apply-amt" data-inv="${inv.id}" value="0" style="width:80px;"></td>
+            </tr>`).join('');
+        if (!rows) rows = '<tr><td colspan="3">No open invoices for this customer</td></tr>';
+
+        openModal(`Apply Credit ${cm.memo_number}`, `
+            <p style="margin-bottom:8px;">Credit remaining: <strong>${formatCurrency(cm.balance_remaining)}</strong></p>
+            <div class="table-container"><table>
+                <thead><tr><th>Invoice</th><th class="amount">Balance</th><th class="amount">Apply</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table></div>
+            <div class="form-actions">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="CreditMemosPage.doApply(${cmId})">Apply Credit</button>
+            </div>`);
+    },
+
+    async doApply(cmId) {
+        const inputs = $$('.apply-amt');
+        for (const input of inputs) {
+            const amt = parseFloat(input.value) || 0;
+            if (amt > 0) {
+                try {
+                    await API.post(`/credit-memos/${cmId}/apply`, {
+                        invoice_id: parseInt(input.dataset.inv), amount: amt,
+                    });
+                } catch (err) { toast(err.message, 'error'); return; }
+            }
+        }
+        toast('Credit applied');
+        closeModal();
+        App.navigate('#/credit-memos');
+    },
+};

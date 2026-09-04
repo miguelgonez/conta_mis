@@ -1,0 +1,6 @@
+{
+  "name": "Slowbooks Pro 2026",
+  "description": "A free and source-available accounting and bookkeeping application, serving as a clean-room replacement for QuickBooks Pro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

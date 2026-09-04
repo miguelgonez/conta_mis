@@ -1,0 +1,254 @@
+/**
+ * Receive Payments — manual allocation across open invoices (we
+ * skipped QB's "auto-apply oldest first" behavior on purpose).
+ */
+const PaymentsPage = {
+    async render() {
+        const payments = await API.get('/payments');
+        let html = `
+            <div class="page-header">
+                <h2>Payments</h2>
+                <button class="btn btn-primary" onclick="PaymentsPage.showForm()">+ Record Payment</button>
+            </div>`;
+
+        if (payments.length === 0) {
+            html += `<div class="empty-state">
+                <p>No payments recorded yet.</p>
+                <button class="btn btn-primary" onclick="PaymentsPage.showForm()" style="margin-top:10px;">+ Record your first payment</button>
+            </div>`;
+        } else {
+            html += `<div class="table-container"><table>
+                <thead><tr>
+                    <th>Date</th><th>Customer</th><th>Method</th><th>Reference</th>
+                    <th class="amount">Amount</th><th>Actions</th>
+                </tr></thead><tbody>`;
+            for (const p of payments) {
+                html += `<tr>
+                    <td>${formatDate(p.date)}</td>
+                    <td>${escapeHtml(p.customer_name || '')}</td>
+                    <td>${escapeHtml(p.method || '')}${p.is_voided ? ' <span style="color:var(--danger);font-weight:700;">[VOID]</span>' : ''}</td>
+                    <td>${escapeHtml(p.reference || p.check_number || '')}</td>
+                    <td class="amount">${formatCurrency(p.amount)}</td>
+                    <td class="actions">
+                        <button class="btn btn-sm btn-secondary" onclick="PaymentsPage.view(${p.id})">View</button>
+                    </td>
+                </tr>`;
+            }
+            html += `</tbody></table></div>`;
+        }
+        return html;
+    },
+
+    async view(id) {
+        const p = await API.get(`/payments/${id}`);
+        let allocHtml = '';
+        if (p.allocations.length) {
+            allocHtml = `<h4 style="margin:12px 0 8px;">Applied to Invoices</h4>
+                <div class="table-container"><table><thead><tr>
+                <th>Invoice</th><th class="amount">Amount</th></tr></thead><tbody>`;
+            for (const a of p.allocations) {
+                allocHtml += `<tr><td>#${a.invoice_id}</td><td class="amount">${formatCurrency(a.amount)}</td></tr>`;
+            }
+            allocHtml += `</tbody></table></div>`;
+        }
+
+        openModal('Payment Details', `
+            <div style="margin-bottom:12px;">
+                <strong>Customer:</strong> ${escapeHtml(p.customer_name || '')}<br>
+                <strong>Date:</strong> ${formatDate(p.date)}<br>
+                <strong>Amount:</strong> ${formatCurrency(p.amount)}<br>
+                <strong>Method:</strong> ${escapeHtml(p.method || 'N/A')}<br>
+                ${p.check_number ? `<strong>Check #:</strong> ${escapeHtml(p.check_number)}<br>` : ''}
+                ${p.reference ? `<strong>Reference:</strong> ${escapeHtml(p.reference)}<br>` : ''}
+                ${p.notes ? `<strong>Notes:</strong> ${escapeHtml(p.notes)}<br>` : ''}
+            </div>
+            ${allocHtml}
+            ${p.is_voided ? '<div style="color:var(--danger);font-weight:700;margin:12px 0;">This payment has been voided.</div>' : ''}
+            <div class="form-actions">
+                ${!p.is_voided ? `<button class="btn btn-danger" onclick="PaymentsPage.void(${p.id})">Void Payment</button>` : ''}
+                ${p.method === 'Check' && p.check_number && !p.is_voided ? `<button class="btn btn-secondary" onclick="window.open('/api/checks/print?payment_id=${p.id}','_blank')">Print Check</button>` : ''}
+                <button class="btn btn-secondary" onclick="closeModal()">Close</button>
+            </div>`);
+    },
+
+    async void(id) {
+        if (!confirm('Void this payment? Invoice balances will be restored.')) return;
+        try {
+            await API.post(`/payments/${id}/void`);
+            toast('Payment voided');
+            closeModal();
+            App.navigate(location.hash);
+        } catch (err) { toast(err.message, 'error'); }
+    },
+
+    _invoices: [],
+
+    async showForm(_ignoredId = null, prefillCustomerId = null) {
+        const [customers, accounts] = await Promise.all([
+            API.get('/customers?active_only=true'),
+            API.get('/accounts'),
+        ]);
+        const bankAccts = accounts.filter(a => a.account_type === 'asset');
+
+        const custOpts = customers.map(c => `<option value="${c.id}"${prefillCustomerId === c.id ? ' selected' : ''}>${escapeHtml(c.name)}</option>`).join('');
+        const bankOpts = bankAccts.map(a => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('');
+
+        openModal('Record Payment', `
+            <form id="payment-form" onsubmit="PaymentsPage.save(event)">
+                <div class="form-grid">
+                    <div class="form-group"><label>Customer *</label>
+                        <select name="customer_id" required onchange="PaymentsPage.loadInvoices(this.value)">
+                            <option value="">Select...</option>${custOpts}</select></div>
+                    <div class="form-group"><label>Date *</label>
+                        <input name="date" type="date" required value="${todayISO()}"></div>
+                    <div class="form-group"><label>Amount *</label>
+                        <input name="amount" type="number" step="0.01" required></div>
+                    <div class="form-group"><label>Method</label>
+                        <select name="method">
+                            <option value="">--</option>
+                            <option>Check</option><option>Cash</option>
+                            <option>Credit Card</option><option>ACH/EFT</option><option>Other</option>
+                        </select></div>
+                    <div class="form-group"><label>Check #</label>
+                        <input name="check_number"></div>
+                    <div class="form-group"><label>Reference</label>
+                        <input name="reference"></div>
+                    <div class="form-group"><label>Deposit To</label>
+                        <select name="deposit_to_account_id">
+                            <option value="">--</option>${bankOpts}</select></div>
+                    <div class="form-group full-width"><label>Notes</label>
+                        <textarea name="notes"></textarea></div>
+                </div>
+                <div id="payment-invoices" style="margin-top:16px;"></div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Record Payment</button>
+                </div>
+            </form>`);
+        // If we opened from the customer details flow, the customer is
+        // already selected but the change event didn't fire — trigger the
+        // invoice list manually so the operator sees the unpaid invoices.
+        if (prefillCustomerId) PaymentsPage.loadInvoices(prefillCustomerId);
+    },
+
+    async loadInvoices(customerId) {
+        if (!customerId) { $('#payment-invoices').innerHTML = ''; return; }
+        const invoices = await API.get(`/invoices?customer_id=${customerId}&status=sent`);
+        const partial = await API.get(`/invoices?customer_id=${customerId}&status=partial`);
+        PaymentsPage._invoices = [...invoices, ...partial].filter(i => i.balance_due > 0);
+
+        if (PaymentsPage._invoices.length === 0) {
+            $('#payment-invoices').innerHTML = '<p style="color:var(--gray-400);">No outstanding invoices</p>';
+            return;
+        }
+
+        let html = `<h4 style="margin-bottom:8px;">Apply to Invoices</h4>
+            <div class="table-container"><table><thead><tr>
+            <th>Invoice</th><th>Date</th><th class="amount">Balance</th><th class="amount">Apply</th>
+            </tr></thead><tbody>`;
+        for (const inv of PaymentsPage._invoices) {
+            html += `<tr>
+                <td>#${escapeHtml(inv.invoice_number)}</td>
+                <td>${formatDate(inv.date)}</td>
+                <td class="amount">${formatCurrency(inv.balance_due)}</td>
+                <td><input class="alloc-amount" data-invoice="${inv.id}" data-max="${inv.balance_due}"
+                    type="number" step="0.01" min="0" max="${inv.balance_due}"
+                    oninput="PaymentsPage._updateAllocStatus()"
+                    style="width:100px; padding:4px 8px; border:1px solid var(--gray-300); border-radius:4px;"></td>
+            </tr>`;
+        }
+        // Running total — updated live as the user types into any allocation
+        // field. Catches over-allocation BEFORE the submit fires.
+        html += `</tbody></table></div>
+            <div id="alloc-status" style="margin-top:8px; padding:8px 10px; border-radius:4px;
+                background:var(--gray-100); font-size:13px;"></div>`;
+        $('#payment-invoices').innerHTML = html;
+        // Also recompute when the payment Amount field changes — the total
+        // we're comparing against is that amount.
+        const amountInput = $('[name="amount"]');
+        if (amountInput && !amountInput._allocWired) {
+            amountInput.addEventListener('input', () => PaymentsPage._updateAllocStatus());
+            amountInput._allocWired = true;
+        }
+        PaymentsPage._updateAllocStatus();
+    },
+
+    _updateAllocStatus() {
+        const status = $('#alloc-status');
+        if (!status) return;
+        const total = parseFloat($('[name="amount"]')?.value) || 0;
+        let allocated = 0;
+        // Scope to the invoice table so we never pick up a stray .alloc-amount
+        // from another view that happens to be in the DOM.
+        const host = $('#payment-invoices');
+        (host ? host.querySelectorAll('.alloc-amount') : []).forEach(input => {
+            allocated += parseFloat(input.value) || 0;
+        });
+        const remaining = total - allocated;
+        const eps = 0.005;  // Decimal noise tolerance
+        if (total === 0 && allocated > eps) {
+            // Amount cleared (or never entered) but money is allocated — this
+            // would submit a NaN/zero payment with real allocations. Warn.
+            status.style.background = '#fde2e2';
+            status.style.color = '#a4242b';
+            status.textContent =
+                `${formatCurrency(allocated)} allocated but the Payment amount is empty. ` +
+                `Enter the amount you received above.`;
+        } else if (total === 0) {
+            status.style.background = 'var(--gray-100)';
+            status.style.color = 'var(--gray-600)';
+            status.textContent = 'Enter a payment amount above to begin allocating.';
+        } else if (remaining > eps) {
+            status.style.background = '#fff4d6';
+            status.style.color = '#7a5500';
+            status.textContent =
+                `${formatCurrency(remaining)} unallocated of ${formatCurrency(total)}. ` +
+                `Fine — the remainder will be tracked as a customer credit.`;
+        } else if (remaining < -eps) {
+            status.style.background = '#fde2e2';
+            status.style.color = '#a4242b';
+            status.textContent =
+                `Over-allocated by ${formatCurrency(Math.abs(remaining))}. ` +
+                `Reduce one of the Apply amounts or increase the Payment amount.`;
+        } else {
+            status.style.background = '#d6f4e0';
+            status.style.color = '#1f6f3a';
+            status.textContent = `Fully allocated (${formatCurrency(total)}).`;
+        }
+    },
+
+    async save(e) {
+        e.preventDefault();
+        const form = e.target;
+        const allocations = [];
+        $$('.alloc-amount').forEach(input => {
+            const amt = parseFloat(input.value);
+            if (amt > 0) {
+                allocations.push({ invoice_id: parseInt(input.dataset.invoice), amount: amt });
+            }
+        });
+
+        const data = {
+            customer_id: parseInt(form.customer_id.value),
+            date: form.date.value,
+            amount: parseFloat(form.amount.value),
+            method: form.method.value || null,
+            check_number: form.check_number.value || null,
+            reference: form.reference.value || null,
+            deposit_to_account_id: form.deposit_to_account_id.value ? parseInt(form.deposit_to_account_id.value) : null,
+            notes: form.notes.value || null,
+            allocations,
+        };
+
+        try {
+            await API.post('/payments', data);
+            toast('Payment recorded');
+            closeModal();
+            App.navigate(location.hash);
+        } catch (err) { toast(err.message, 'error'); }
+    },
+};
+
+// Top-level const creates no window property — the topbar's
+// data-action dispatch (bootstrap.js callByPath) needs this export.
+window.PaymentsPage = PaymentsPage;
